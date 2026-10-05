@@ -464,20 +464,29 @@ def _verify_phrases_cover_text(
 
 
 def _future_expires_at(
-    expires_in_seconds: int | None, expires_at: datetime | None
+    expires_in_seconds: int | None,
+    expires_at: datetime | None,
+    now: datetime,
 ) -> datetime | None:
-    """解析令牌到期时间；显式到期时刻必须晚于当前时间，否则 422。"""
+    """按给定服务端时刻解析令牌到期时间；显式到期时刻必须晚于该时刻，否则 422。
+
+    相对时长（expires_in_seconds）一律在**签发时刻**（调用方取齐全部必要行锁、
+    确认快照仍可发布后取得的服务端时刻 now）才换算为绝对时刻：等待版本/清单/
+    快照行锁的耗时不占用令牌寿命，避免“发布成功却签出首次读取即过期的令牌”。
+    显式 expires_at 为绝对时刻：请求到达时与签发时刻各核对一次，签发时已到点
+    则沿用既有 422 整次拒绝，不留下新快照或令牌。
+    """
     if expires_at is not None:
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at <= datetime.now(timezone.utc):
+        if expires_at <= now:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="expires_at must be in the future",
             )
         return expires_at
     if expires_in_seconds is not None:
-        return datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
+        return now + timedelta(seconds=expires_in_seconds)
     return None
 
 
@@ -540,13 +549,18 @@ def _normalize_window(
     return open_at.astimezone(timezone.utc), close_at.astimezone(timezone.utc)
 
 
-def _validate_window_at_submission(close_at: datetime | None) -> None:
+def _validate_window_at_submission(close_at: datetime | None, now: datetime | None = None) -> None:
     """提交（直接发布/受控申请）时核对时段：截止时刻必须仍晚于当前服务端时刻。
 
     开放时刻可以落在过去（允许“立即开放”）；截止已到则整次请求 422 拒绝，
     不产生快照、令牌或待审申请。成对性与开放早于截止由 schema 保证。
+
+    直接发布在取得必要行锁后会以获锁时刻 now 再核对一次（now 默认取当前
+    服务端时刻）：等待版本/清单/快照行锁期间请求携带的截止时刻可能恰好到点，
+    必须沿用同一 422 整次拒绝，绝不签发“首次读取即落在窗口外”的令牌。
     """
-    if close_at is not None and close_at <= datetime.now(timezone.utc):
+    check_now = now if now is not None else datetime.now(timezone.utc)
+    if close_at is not None and close_at <= check_now:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="window_close_at must be in the future",
@@ -782,6 +796,14 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
     填写且开放早于截止，提交时截止已到则 422 拒绝；均省略表示不携带时段——
     快照首次发布未带时段则无时段限制（兼容既有请求），已有时段则沿用首次设置。
     时段只随快照首次发布固定：同版本后续签发显式填写不同时段一律 409，不改写快照。
+
+    所有与“当前服务端时刻”有关的判定（定时撤回计划是否到点、阅览时段截止、
+    令牌到期换算）一律以**取得必要行锁（版本行、清单行、快照行）、确认快照仍
+    可发布之后**取得的服务端时刻 now 为准（“先取锁、后取时”）：行锁等待可能被
+    并发操作拖过任意时长，绝不能用等待前缓存的时刻换算相对到期——否则等待超过
+    expires_in_seconds 时会签出“首次读取即过期”的令牌。相对时长在签发时刻才
+    换算为绝对时刻，等待耗时不占用令牌寿命；显式 expires_at 或本次快照阅览截止
+    在等待中到点，则沿用既有 422 整次拒绝，不留下新快照或令牌。
     """
     # 记录永不删除：普通读即可判定存在性（不加行锁，保持与公开读取
     # “快照行 → 记录行”锁序不引入新的交叉环）。
@@ -815,11 +837,13 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
             status_code=status.HTTP_409_CONFLICT,
             detail="original text of this record version has been destroyed",
         )
-    expires_at = _future_expires_at(payload.expires_in_seconds, payload.expires_at)
+    # 提交时刻的快速失败校验（成对性/开放早于截止已在 schema 422 校验）：
+    # 显式到期时刻必须晚于提交时刻；请求携带的阅览截止时刻必须仍在未来。
+    # 二者在取得全部必要行锁后还会以获锁时刻再核对一次（等待可能跨过截止）。
+    _validate_expiry_policy(payload.expires_in_seconds, payload.expires_at)
     window_open_at, window_close_at = _normalize_window(
         payload.window_open_at, payload.window_close_at
     )
-    # 提交时截止已到则整次拒绝（成对性/开放早于截止已在 schema 422 校验）
     _validate_window_at_submission(window_close_at)
     version_intervals = [(iv["start"], iv["end"]) for iv in version.intervals]
     # 敏感短语核验：先锁清单单行并在锁内核验，行锁持有至本次发布提交，
@@ -849,15 +873,32 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
         .where(Snapshot.record_id == record_id, Snapshot.version == payload.version)
         .with_for_update()
     ).scalar_one()
+    # 此刻起持有全部必要行锁（版本行、清单行、快照行）：now 是本次签发唯一
+    # 有效的服务端判定时刻——任一行锁的等待都可能跨过定时计划到点、阅览截止
+    # 或显式令牌到期，绝不能复用等待前缓存的时刻。
+    now = datetime.now(timezone.utc)
     # 到点的定时撤回计划先在快照行锁内结算，再判定撤回状态：
     # 计划到点后该版本不能通过再次直接发布重新公开。结算先提交落库，再返回 409。
-    _settle_snapshot_withdrawal_plans(db, snapshot, datetime.now(timezone.utc))
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
     if snapshot.withdrawn_at is not None:
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot has been withdrawn and cannot be published again",
         )
+    # 以获锁后的 now 重新核对请求携带的两个绝对截止：显式 expires_at 或本次
+    # 快照阅览截止在等待行锁期间到点的，沿用既有 422 整次拒绝——回滚本次尚未
+    # 提交的快照 INSERT，不留下新快照或令牌。
+    # 相对到期时长 expires_in_seconds 此刻才换算为绝对时刻：等待耗时不占用
+    # 令牌寿命，响应与落库的 expires_at 同为该签发时刻换算结果，首读不会即过期。
+    try:
+        _validate_window_at_submission(window_close_at, now)
+        expires_at = _future_expires_at(
+            payload.expires_in_seconds, payload.expires_at, now
+        )
+    except HTTPException:
+        db.rollback()
+        raise
     # 快照时段首次发布后不可变：本次省略则沿用，显式不同则 409（不改写快照）。
     effective_open_at, effective_close_at = _resolve_snapshot_window(
         existing_open_at=snapshot.window_open_at,

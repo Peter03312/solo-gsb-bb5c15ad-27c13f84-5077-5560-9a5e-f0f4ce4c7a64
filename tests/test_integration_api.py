@@ -4482,6 +4482,207 @@ class SnapshotReadingWindowIntegrationTests(unittest.TestCase):
         self.assertEqual(self._token_status(tok)["reads_used"], 1)
         self.assertEqual(self._read_events_count(sid), 1)
 
+    # ---- 直接发布：签发时刻（获锁后）换算相对到期、复核绝对截止 ----
+
+    def _publish_in_thread(self, body):
+        """在工作线程中发起直接发布，返回 (线程, 结果字典)。"""
+        result = {}
+
+        def do_publish():
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json=body,
+            )
+            result["status"] = r.status_code
+            result["body"] = r.json()
+
+        thread = threading.Thread(target=do_publish)
+        thread.start()
+        return thread, result
+
+    def _snapshot_rows_direct(self):
+        """直接查库返回本记录版本 -> 快照状态（用于验证拒绝未留下快照）。"""
+        from app.db import SessionLocal
+        from app.models import Snapshot as SnapshotModel
+
+        with SessionLocal() as session:
+            rows = (
+                session.query(SnapshotModel)
+                .filter(SnapshotModel.record_id == self.record_id)
+                .all()
+            )
+            return {
+                row.version: (
+                    "withdrawn" if row.withdrawn_at is not None else "published"
+                )
+                for row in rows
+            }
+
+    def _token_count_direct(self):
+        from app.db import SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+        from app.models import Snapshot as SnapshotModel
+
+        with SessionLocal() as session:
+            return (
+                session.query(ReadTokenModel)
+                .join(SnapshotModel, ReadTokenModel.snapshot_id == SnapshotModel.id)
+                .filter(SnapshotModel.record_id == self.record_id)
+                .count()
+            )
+
+    def test_direct_publish_relative_expiry_measured_from_issuance_after_locks(self):
+        """相对到期自签发时刻（取齐行锁后）换算：等待超过时长，令牌仍足时可读。
+
+        旧实现在等待清单/快照行锁前即换算 expires_in_seconds；协调事务持有快照行
+        锁超过该时长后，旧实现会签发首次读取就已过期的令牌。
+        """
+        now = datetime.now(timezone.utc)
+        # 首次发布先产生快照，随后由协调事务持该快照行锁阻塞本次直接发布
+        seed = self._publish(body={"max_reads": 10})
+        sid = seed.json()["snapshot_id"]
+        holder = self._hold_lock_in_worker(
+            "SELECT id FROM snapshots WHERE id = :sid FOR UPDATE",
+            {"sid": sid},
+            delay=1.3,
+        )
+        t, result = self._publish_in_thread(
+            {"version": 1, "max_reads": 5, "expires_in_seconds": 1}
+        )
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["status"], 201, result.get("body"))
+        body = result["body"]
+        self.assertEqual(body["snapshot_id"], sid)
+        # expires_at 必须晚于响应返回时刻约一整个相对时长（而非请求发起前的时刻）
+        expires_at = datetime.fromisoformat(body["expires_at"])
+        self.assertGreater(
+            (expires_at - datetime.now(timezone.utc)).total_seconds(), 0.8
+        )
+        # 响应与落库的 expires_at 一致；首次读取成功扣次
+        self._read(sid, body["token"])
+        self.assertEqual(self._token_status(body["token"])["reads_used"], 1)
+        from app.db import SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.query(ReadTokenModel)
+                .filter(ReadTokenModel.token == body["token"])
+                .one()
+                .expires_at,
+                expires_at,
+            )
+
+    def test_direct_publish_waiting_past_explicit_expires_at_is_422_leaves_nothing(self):
+        """等待快照行锁期间显式 expires_at 到点：沿用既有 422，不留下新令牌。"""
+        now = datetime.now(timezone.utc)
+        seed = self._publish()
+        sid = seed.json()["snapshot_id"]
+        before_tokens = self._token_count_direct()
+        deadline = now + timedelta(milliseconds=700)
+        holder = self._hold_lock_in_worker(
+            "SELECT id FROM snapshots WHERE id = :sid FOR UPDATE",
+            {"sid": sid},
+            delay=1.3,
+        )
+        t, result = self._publish_in_thread(
+            {"version": 1, "expires_at": _iso(deadline)}
+        )
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["status"], 422, result.get("body"))
+        self.assertEqual(result["body"]["detail"], "expires_at must be in the future")
+        # 不留下新令牌；快照仍是首次发布那一份、仍公开
+        self.assertEqual(self._token_count_direct(), before_tokens)
+        self.assertEqual(self._snapshot_rows_direct(), {1: "published"})
+
+    def test_direct_publish_waiting_past_window_close_is_422_leaves_nothing(self):
+        """等待快照行锁期间本次阅览截止到点：沿用既有 422，不留下快照或令牌。
+
+        使用一个尚无快照的新版本，并让协调事务持有版本行（锁序中快照插入前的
+        最后一把相关锁之一之前的阻塞点：直接发布先锁版本行），使本次发布在
+        换算到期前等待到截止之后；拒绝必须整次回滚，不产生新快照。
+        """
+        # 先产生版本 2
+        rev = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={
+                "base_version": 1,
+                "text": TEXT_V2,
+                "intervals": [],
+            },
+        )
+        self.assertEqual(rev.status_code, 200, rev.text)
+        now = datetime.now(timezone.utc)
+        close_at = now + timedelta(milliseconds=700)
+        # 协调事务持有版本 2 的版本行锁直到截止之后：发布在版本行锁上排队，
+        # 获锁后旧时间缓存已跨过截止——修复前会错误签发窗口外令牌。
+        holder = self._hold_lock_in_worker(
+            "SELECT record_id, version FROM record_versions "
+            "WHERE record_id = :rid AND version = 2 FOR UPDATE",
+            {"rid": str(self.record_id)},
+            delay=1.3,
+        )
+        t, result = self._publish_in_thread(
+            {
+                "version": 2,
+                "max_reads": 3,
+                "window_open_at": _iso(now - timedelta(seconds=10)),
+                "window_close_at": _iso(close_at),
+            }
+        )
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["status"], 422, result.get("body"))
+        self.assertIn("window_close_at", result["body"]["detail"])
+        # 整次拒绝：版本 2 无快照（版本 1 从未发布），全记录无令牌
+        self.assertEqual(self._snapshot_rows_direct(), {})
+        self.assertEqual(self._token_count_direct(), 0)
+
+    def test_direct_publish_waiting_past_window_close_on_existing_snapshot_is_422(self):
+        """已有时段快照的再次签发：等待快照行锁跨过其请求截止后 422，不签新令牌。"""
+        now = datetime.now(timezone.utc)
+        close_at = now + timedelta(milliseconds=700)
+        seed = self._publish(
+            body={
+                "window_open_at": _iso(now - timedelta(seconds=10)),
+                "window_close_at": _iso(close_at),
+            }
+        )
+        sid = seed.json()["snapshot_id"]
+        before_tokens = self._token_count_direct()
+        holder = self._hold_lock_in_worker(
+            "SELECT id FROM snapshots WHERE id = :sid FOR UPDATE",
+            {"sid": sid},
+            delay=1.3,
+        )
+        # 显式重复首次时段（幂等同设置）：若不复核截止，旧实现会在窗口关闭后
+        # 签出一支首次读取即 403 的令牌。
+        t, result = self._publish_in_thread(
+            {
+                "version": 1,
+                "window_open_at": _iso(now - timedelta(seconds=10)),
+                "window_close_at": _iso(close_at),
+            }
+        )
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["status"], 422, result.get("body"))
+        self.assertIn("window_close_at", result["body"]["detail"])
+        self.assertEqual(self._token_count_direct(), before_tokens)
+
 
 class VersionOriginalDestructionIntegrationTests(unittest.TestCase):
     """历史版本原文销毁：原子清除、幂等回放、销毁后发布/申请/批准拒绝、其余约定不变。"""
