@@ -4483,6 +4483,383 @@ class SnapshotReadingWindowIntegrationTests(unittest.TestCase):
         self.assertEqual(self._read_events_count(sid), 1)
 
 
+class DirectPublishIssuanceTimeIntegrationTests(unittest.TestCase):
+    """直接发布的签发时刻：取齐版本/清单/快照行锁、确认快照仍可发布后的 now。
+
+    旧实现在等待敏感短语清单行锁与快照行锁**之前**就把 expires_in_seconds
+    换算成绝对到期时刻；并发操作使等待超过该时长时，发布虽成功，却签出一枚
+    首次读取即过期的令牌（响应与落库的 expires_at 还是等待前的旧时刻）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+
+    # ---- 工具方法 ----
+
+    def _publish(self, body, expected=201):
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1, **body},
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _hold_settings_lock(self, delay=1.3):
+        """协调事务持有敏感短语清单单行 FOR UPDATE 锁 delay 秒后提交。"""
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        acquired = threading.Event()
+
+        def hold():
+            session = SessionLocal()
+            try:
+                session.execute(
+                    sql_text(
+                        "SELECT id FROM sensitive_phrase_settings "
+                        "WHERE id = 1 FOR UPDATE"
+                    )
+                )
+                acquired.set()
+                time.sleep(delay)
+                session.commit()
+            except Exception:  # pragma: no cover - 仅在异常时暴露
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(acquired.wait(timeout=5), "协调线程未能取得清单行锁")
+        return thread
+
+    def _publish_in_thread(self, body):
+        result = {}
+
+        def do_publish():
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1, **body},
+            )
+            result["status"] = r.status_code
+            result["body"] = r.json()
+
+        thread = threading.Thread(target=do_publish)
+        thread.start()
+        return thread, result
+
+    def _snapshot_count(self):
+        from app.db import SessionLocal
+        from app.models import Snapshot as SnapshotModel
+
+        with SessionLocal() as session:
+            return (
+                session.query(SnapshotModel)
+                .filter(SnapshotModel.record_id == self.record_id)
+                .count()
+            )
+
+    def _token_expires_at_in_db(self, token):
+        from app.db import SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+
+        with SessionLocal() as session:
+            return session.get(ReadTokenModel, token).expires_at
+
+    # ---- 相对到期时长：从签发时刻起算，等待不占用令牌寿命 ----
+
+    def test_relative_expiry_measured_at_issuance_after_lock_wait(self):
+        """等待清单行锁超过 expires_in_seconds：仍签发有效令牌，寿命从获锁后起算。"""
+        t0 = datetime.now(timezone.utc)
+        holder = self._hold_settings_lock(delay=1.3)
+        thread, result = self._publish_in_thread({"expires_in_seconds": 2})
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["status"], 201, result["body"])
+        token = result["body"]["token"]
+        expires_at = datetime.fromisoformat(result["body"]["expires_at"])
+        # 旧实现把到期算成 t0 + 2s（等待 1.3s 后只剩约 0.7s，临近/已过期）；
+        # 新实现从获锁后的时刻起算，到期必须明显晚于“等待结束时刻 + 寿命的余量”，
+        # 即落库 expires_at > t0 + 等待 + 寿命 - 容差。
+        self.assertGreater(expires_at, t0 + timedelta(seconds=1.3 + 2 - 0.3))
+        # 响应与落库的 expires_at 完全一致
+        db_expires_at = self._token_expires_at_in_db(token)
+        self.assertEqual(
+            expires_at.astimezone(timezone.utc),
+            db_expires_at.astimezone(timezone.utc),
+        )
+        # 签出后首次读取立即可用（旧实现此处即 403）
+        r = self.client.get(
+            f"/public/snapshots/{result['body']['snapshot_id']}?token={token}"
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 寿命仍为完整的 2s（不是被等待吃掉的 0.7s）：等待结束后约 1s 仍可读
+        time.sleep(1.0)
+        r = self.client.get(
+            f"/public/snapshots/{result['body']['snapshot_id']}?token={token}"
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    # ---- 显式 expires_at 在等待中到达：沿用既有 422，不留快照/令牌 ----
+
+    def test_explicit_expires_at_reaching_during_lock_wait_is_entirely_rejected(self):
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=700)
+        holder = self._hold_settings_lock(delay=1.3)
+        thread, result = self._publish_in_thread({"expires_at": _iso(target)})
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["status"], 422, result["body"])
+        # 整次拒绝：不留下新快照或令牌
+        self.assertEqual(self._snapshot_count(), 0)
+        # 锁释放、时刻过去后重试（带新的未来到期）成功，证明未残留半完成状态
+        retry = self._publish({"expires_in_seconds": 3600})
+        self.assertEqual(self._snapshot_count(), 1)
+        self.assertTrue(retry.json()["token"])
+
+    # ---- 快照阅览截止在等待中到达（首次发布）：422，不留快照/令牌 ----
+
+    def test_first_publish_window_closing_during_lock_wait_is_entirely_rejected(self):
+        now = datetime.now(timezone.utc)
+        body = {
+            "window_open_at": _iso(now - timedelta(seconds=10)),
+            "window_close_at": _iso(now + timedelta(milliseconds=700)),
+        }
+        holder = self._hold_settings_lock(delay=1.3)
+        thread, result = self._publish_in_thread(body)
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["status"], 422, result["body"])
+        # 首次发布的快照 INSERT 随回滚撤销：不留下新快照
+        self.assertEqual(self._snapshot_count(), 0)
+        # 锁释放后用新窗口重试成功
+        later = datetime.now(timezone.utc)
+        retry = self._publish(
+            {
+                "window_open_at": _iso(later - timedelta(seconds=10)),
+                "window_close_at": _iso(later + timedelta(hours=1)),
+            }
+        )
+        self.assertEqual(self._snapshot_count(), 1)
+        self.assertTrue(retry.json()["token"])
+
+    # ---- 沿用快照首次窗口的再次签发：截止在等待中到达则 422、不签新令牌 ----
+
+    def test_republish_inherited_window_closing_during_wait_is_entirely_rejected(self):
+        now = datetime.now(timezone.utc)
+        first = self._publish(
+            {
+                "window_open_at": _iso(now - timedelta(seconds=10)),
+                "window_close_at": _iso(now + timedelta(milliseconds=700)),
+            }
+        )
+        sid = first.json()["snapshot_id"]
+        # 再次签发省略时段：沿用首次窗口；其截止很快到达
+        holder = self._hold_settings_lock(delay=1.3)
+        thread, result = self._publish_in_thread({})
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["status"], 422, result["body"])
+        # 未签出新令牌：快照仍只有首次发布的一枚令牌
+        from app.db import SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+
+        with SessionLocal() as session:
+            token_count = (
+                session.query(ReadTokenModel)
+                .filter(ReadTokenModel.snapshot_id == sid)
+                .count()
+            )
+        self.assertEqual(token_count, 1)
+        self.assertEqual(self._snapshot_count(), 1)
+
+    # ---- 等待期间定时撤回计划到点：先结算再 409，不签新令牌 ----
+
+    def test_lock_wait_past_plan_due_settles_then_conflicts_and_issues_no_token(self):
+        from app.db import SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+
+        first = self._publish({})
+        sid = first.json()["snapshot_id"]
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=700)
+        plan = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": sid,
+                "scheduled_at": _iso(target),
+                "reason": "直接发布等锁期间到点撤回",
+            },
+        )
+        self.assertEqual(plan.status_code, 201, plan.text)
+        plan_id = plan.json()["plan_id"]
+        # 停掉后台结算；同时持有清单行与快照行锁，使到点只能由发布事务获锁后结算
+        app_main._withdrawal_scheduler.stop()
+        try:
+            holder = self._hold_settings_and_snapshot_lock(sid, delay=1.3)
+            thread, result = self._publish_in_thread({})
+            holder.join(timeout=10)
+            self.assertFalse(holder.is_alive())
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+        finally:
+            app_main._withdrawal_scheduler.start()
+        self.assertEqual(result["status"], 409, result["body"])
+        # 计划按预定时刻/原因完成撤回并随本次拒绝提交
+        got = self.client.get(
+            f"/snapshot-withdrawal-plans/{plan_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(got["status"], "completed")
+        snap = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(snap["status"], "withdrawn")
+        # 未签出新令牌（仅首次发布一枚）
+        with SessionLocal() as session:
+            token_count = (
+                session.query(ReadTokenModel)
+                .filter(ReadTokenModel.snapshot_id == sid)
+                .count()
+            )
+        self.assertEqual(token_count, 1)
+
+    def _hold_settings_and_snapshot_lock(self, snapshot_id, delay=1.3):
+        """协调事务同时持有清单行与快照行 FOR UPDATE 锁 delay 秒后提交。"""
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        acquired = threading.Event()
+
+        def hold():
+            session = SessionLocal()
+            try:
+                session.execute(
+                    sql_text(
+                        "SELECT id FROM sensitive_phrase_settings "
+                        "WHERE id = 1 FOR UPDATE"
+                    )
+                )
+                session.execute(
+                    sql_text("SELECT id FROM snapshots WHERE id = :sid FOR UPDATE"),
+                    {"sid": str(snapshot_id)},
+                )
+                acquired.set()
+                time.sleep(delay)
+                session.commit()
+            except Exception:  # pragma: no cover - 仅在异常时暴露
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(acquired.wait(timeout=5), "协调线程未能取得清单/快照行锁")
+        return thread
+
+    # ---- 等待期间清单被替换：按获锁后的已提交清单核验（仍须覆盖） ----
+
+    def test_phrase_verification_uses_settings_version_after_lock_wait(self):
+        """发布等清单行锁期间清单被替换：获锁后按已提交的新清单核验（422，不留快照）。"""
+        # 初始停用核验
+        self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []}
+        )
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        acquired = threading.Event()
+
+        def hold_then_replace():
+            # 先持有清单行锁让发布排队；持锁一段时间（跨过一个明确的等待窗口）
+            # 后在同一事务提交“启用新清单”，再释放锁：发布获锁后必须按新清单核验。
+            session = SessionLocal()
+            try:
+                session.execute(
+                    sql_text(
+                        "SELECT id FROM sensitive_phrase_settings "
+                        "WHERE id = 1 FOR UPDATE"
+                    )
+                )
+                acquired.set()
+                time.sleep(0.8)
+                session.execute(
+                    sql_text(
+                        "UPDATE sensitive_phrase_settings "
+                        "SET phrases = CAST(:p AS jsonb), version = version + 1, "
+                        "updated_at = now() WHERE id = 1"
+                    ),
+                    {"p": json.dumps(["患者"])},
+                )
+                session.commit()
+            except Exception:  # pragma: no cover
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        holder = threading.Thread(target=hold_then_replace)
+        holder.start()
+        self.assertTrue(acquired.wait(timeout=5))
+        thread, result = self._publish_in_thread({})
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        # “患者”命中原文码点 [0,2)，而提交的遮蔽区间从 [2,4) 起，未覆盖：
+        # 获锁后按新清单核验 -> 422
+        self.assertEqual(result["status"], 422, result["body"])
+        self.assertEqual(self._snapshot_count(), 0)
+        # 停用后重试成功，证明未残留半完成状态
+        self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []}
+        )
+        self._publish({})
+        self.assertEqual(self._snapshot_count(), 1)
+
+    # ---- 无等待对照组：正常相对到期签发与读取 ----
+
+    def test_relative_expiry_without_wait_issues_immediately_readable_token(self):
+        t0 = datetime.now(timezone.utc)
+        r = self._publish({"expires_in_seconds": 2})
+        expires_at = datetime.fromisoformat(r.json()["expires_at"])
+        self.assertGreater(expires_at, t0 + timedelta(seconds=2 - 0.3))
+        read = self.client.get(
+            f"/public/snapshots/{r.json()['snapshot_id']}?token={r.json()['token']}"
+        )
+        self.assertEqual(read.status_code, 200, read.text)
+
+
 class VersionOriginalDestructionIntegrationTests(unittest.TestCase):
     """历史版本原文销毁：原子清除、幂等回放、销毁后发布/申请/批准拒绝、其余约定不变。"""
 

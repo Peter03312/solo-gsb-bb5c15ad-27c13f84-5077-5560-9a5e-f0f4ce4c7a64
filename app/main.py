@@ -359,8 +359,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.11.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 版本化数据库升级）",
+    version="1.12.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 直接发布签发时刻修正 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -461,24 +461,6 @@ def _verify_phrases_cover_text(
         db.rollback()
         raise
     return settings_row
-
-
-def _future_expires_at(
-    expires_in_seconds: int | None, expires_at: datetime | None
-) -> datetime | None:
-    """解析令牌到期时间；显式到期时刻必须晚于当前时间，否则 422。"""
-    if expires_at is not None:
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at <= datetime.now(timezone.utc):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="expires_at must be in the future",
-            )
-        return expires_at
-    if expires_in_seconds is not None:
-        return datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
-    return None
 
 
 def _request_info(request: PublishRequestModel) -> PublishRequestInfo:
@@ -782,6 +764,16 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
     填写且开放早于截止，提交时截止已到则 422 拒绝；均省略表示不携带时段——
     快照首次发布未带时段则无时段限制（兼容既有请求），已有时段则沿用首次设置。
     时段只随快照首次发布固定：同版本后续签发显式填写不同时段一律 409，不改写快照。
+
+    签发时刻（“先取锁、后取时”）：版本行、敏感短语清单行与快照行锁可能因并发
+    操作（版本原文销毁、清单替换、撤回/定时撤回结算等）等待任意时长。所有与
+    “当前服务端时刻”有关的签发判定——相对到期时长 expires_in_seconds 的换算、
+    显式 expires_at 是否仍未到、快照阅览时段（本次的或沿用首次发布的）是否已
+    截止、定时撤回计划是否到点——一律以**取齐这些行锁、惰性结算到点计划并确认
+    快照仍可发布之后**取得的服务端时刻 now 为准。相对时长从 now 起算（锁等待
+    不占用令牌寿命），响应回显与令牌落库的 expires_at 为同一绝对时刻；显式
+    expires_at 或阅览截止在等待中到达，则沿用既有 422 整次拒绝（回滚本次快照
+    INSERT），绝不留下新快照或令牌。
     """
     # 记录永不删除：普通读即可判定存在性（不加行锁，保持与公开读取
     # “快照行 → 记录行”锁序不引入新的交叉环）。
@@ -815,17 +807,21 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
             status_code=status.HTTP_409_CONFLICT,
             detail="original text of this record version has been destroyed",
         )
-    expires_at = _future_expires_at(payload.expires_in_seconds, payload.expires_at)
+    # 请求级（取锁前）快速校验，尽早拒绝明显非法的请求；这两道校验都在取齐
+    # 行锁、确认快照仍可发布后**再次**进行权威判定，锁等待期间跨过界限时以
+    # 取锁后的服务端时刻为准。
+    explicit_expires_at = payload.expires_at
+    if explicit_expires_at is not None and explicit_expires_at.tzinfo is None:
+        explicit_expires_at = explicit_expires_at.replace(tzinfo=timezone.utc)
+    _validate_expiry_policy(payload.expires_in_seconds, explicit_expires_at)
     window_open_at, window_close_at = _normalize_window(
         payload.window_open_at, payload.window_close_at
     )
-    # 提交时截止已到则整次拒绝（成对性/开放早于截止已在 schema 422 校验）
     _validate_window_at_submission(window_close_at)
     version_intervals = [(iv["start"], iv["end"]) for iv in version.intervals]
-    # 敏感短语核验：先锁清单单行并在锁内核验，行锁持有至本次发布提交，
-    # 保证核验与提交对应同一已提交清单版本（与清单替换并发时按事务先后串行）。
-    # 不通过则整次拒绝：不产生快照或令牌。
-    _verify_phrases_cover_text(db, version.original_text, version_intervals)
+    # 敏感短语清单行（固定锁序的第一把）：在整个核验与提交期间持有其 FOR UPDATE
+    # 行锁，与清单的原子替换串行化，保证核验与提交对应同一已提交清单版本。
+    settings_row = _lock_sensitive_phrase_settings(db)
     redacted = redact_text(version.original_text, version_intervals)
     # 快照按 (record_id, version) 唯一：并发发布时唯一约束保证只落库一份，
     # 且快照与令牌在同一事务提交，不会出现部分发布。
@@ -849,22 +845,57 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
         .where(Snapshot.record_id == record_id, Snapshot.version == payload.version)
         .with_for_update()
     ).scalar_one()
+    # 先取锁、后取时：此刻起持有本次签发所需的全部相关行锁（版本行、清单行、
+    # 快照行）。版本行锁、清单行锁与快照行锁上的等待都可能跨越令牌显式到期、
+    # 快照阅览时段截止或定时撤回计划到点；绝不能用等待前缓存的时刻做签发判定。
+    now = datetime.now(timezone.utc)
     # 到点的定时撤回计划先在快照行锁内结算，再判定撤回状态：
     # 计划到点后该版本不能通过再次直接发布重新公开。结算先提交落库，再返回 409。
-    _settle_snapshot_withdrawal_plans(db, snapshot, datetime.now(timezone.utc))
+    _settle_snapshot_withdrawal_plans(db, snapshot, now)
     if snapshot.withdrawn_at is not None:
         db.commit()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot has been withdrawn and cannot be published again",
         )
-    # 快照时段首次发布后不可变：本次省略则沿用，显式不同则 409（不改写快照）。
+    # 快照时段首次发布后不可变：本次省略则沿用，显式不同则 409（绝不改写快照，
+    # 含首次发布的新 INSERT，随后回滚即不留下快照）。
     effective_open_at, effective_close_at = _resolve_snapshot_window(
         existing_open_at=snapshot.window_open_at,
         existing_close_at=snapshot.window_close_at,
         requested_open_at=window_open_at,
         requested_close_at=window_close_at,
     )
+    # 取锁后权威判定（覆盖行锁等待期间跨过界限的情形，沿用既有 422 整次拒绝；
+    # 失败回滚本次尚未提交的快照 INSERT，不留下新快照或令牌）：
+    # 1) 快照阅览时段（本次请求的或复用首次发布的）截止已到；
+    # 2) 显式 expires_at 已在等待期间到达。
+    if effective_close_at is not None and effective_close_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="window_close_at must be in the future",
+        )
+    if explicit_expires_at is not None and explicit_expires_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="expires_at must be in the future",
+        )
+    # 在已锁定的清单版本上核验原文与区间；不通过则整次回滚（含本次快照
+    # INSERT），不留下快照或令牌。
+    try:
+        _verify_against_settings(settings_row, version.original_text, version_intervals)
+    except HTTPException:
+        db.rollback()
+        raise
+    # 令牌到期只在签发时刻（取齐行锁、确认快照仍可发布之后的 now）最终确定，
+    # 响应回显与落库使用同一个绝对时刻：相对时长从 now 起算，等待行锁耗费的
+    # 时间绝不占用令牌寿命；显式 expires_at 沿用请求时的选择。
+    if payload.expires_in_seconds is not None:
+        expires_at = now + timedelta(seconds=payload.expires_in_seconds)
+    else:
+        expires_at = explicit_expires_at
     token = ReadToken(
         token=secrets.token_urlsafe(32),
         snapshot_id=snapshot.id,

@@ -6,7 +6,7 @@
 
 支持两种发布方式：
 
-- **直接发布**（既有能力）：维护人员凭服务密钥直接发布指定版本；
+- **直接发布**（既有能力）：维护人员凭服务密钥直接发布指定版本；令牌到期与阅览截止的时刻判定以**取齐版本行、敏感短语清单行与快照行锁、确认快照仍可发布之后的服务端时刻**为准（相对到期时长从签发时刻起算，等待不占用令牌寿命；显式到期或阅览截止在等待中到达则沿用既有 `422` 整次拒绝，不留新快照或令牌；详见“直接发布的签发时刻”）；
 - **受控发布**（申请-复核）：机构先把记录标记为受控，操作者用**各自的凭据与身份**提交指定历史版本的发布申请，由**另一名具复核资格者**批准或驳回（申请人不得复核）；批准时在同一事务生成不可变快照与新读取令牌。批准的时间界限（定时撤回计划到点、冻结阅览时段截止）一律以**取齐申请行、敏感短语清单行与快照行锁之后的服务端时刻**判定——即使复核请求在数据库行锁上等待并跨过生效/截止时刻，获锁后仍按新时刻拒绝（`409`，申请保持待审、可驳回、不签令牌），计划到点时撤回以预定时刻与计划原因落库。
 
 已发布版本若不应继续公开，机构可凭服务密钥将对应**快照永久撤回**：撤回只作用于该快照，同记录其他版本继续可读；撤回后无论持有该快照的哪枚令牌，新开始的公开读取一律沿用模糊 `403 snapshot unavailable` 且不消耗读取次数；该版本再次直接发布、提交受控申请或批准撤回前已在审的申请均返回 `409`，待审申请仍可驳回。
@@ -171,7 +171,7 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `POST` | `/records` | 服务密钥 | 创建记录（版本 1），提交原文与敏感区间 |
 | `PUT` | `/records/{record_id}` | 服务密钥 | 修订：携带 `base_version`，过期返回 `409` 与当前版本 |
 | `PUT` | `/records/{record_id}/controlled` | 服务密钥 | 将记录设为受控发布（幂等） |
-| `POST` | `/records/{record_id}/publish` | 服务密钥 | 直接发布指定版本（可带 `max_reads` 上限与外部阅览时段 `window_open_at`/`window_close_at`）；**受控记录一律 `409` 拒绝** |
+| `POST` | `/records/{record_id}/publish` | 服务密钥 | 直接发布指定版本（可带 `max_reads` 上限与外部阅览时段 `window_open_at`/`window_close_at`）；到期换算与阅览截止以取齐行锁、确认可发布后的服务端时刻为准（见“直接发布的签发时刻”）；**受控记录一律 `409` 拒绝** |
 | `POST` | `/records/{record_id}/publish-requests` | operator | 提交受控发布申请（冻结指定历史版本内容、`max_reads` 与外部阅览时段） |
 | `POST` | `/publish-requests/{request_id}/approve` | reviewer（非申请人） | 批准：同事务生成快照 + 新读取令牌（冻结的上限生效） |
 | `POST` | `/publish-requests/{request_id}/reject` | reviewer（非申请人） | 驳回（可带 `reason`），驳回为终态，不生成令牌或计数 |
@@ -313,7 +313,7 @@ curl -sS -X PUT http://localhost:8000/records/<RID> \
 # => {"record_id":"<RID>","version":2}
 # 过期时 => 409 {"detail":{"message":"base_version is stale","current_version":2}}
 
-# 3. 发布版本 2（可另加 "expires_in_seconds": 3600、"expires_at": "2026-10-01T00:00:00Z"、"max_reads": 5，
+# 3. 发布版本 2（可另加 "expires_in_seconds": 3600（取锁后起算）、"expires_at": "2026-10-01T00:00:00Z"、"max_reads": 5，
 #    或外部阅览时段 "window_open_at": "2026-10-03T08:00:00Z"、"window_close_at": "2026-10-03T18:00:00Z"，两者须成对）
 curl -sS -X POST http://localhost:8000/records/<RID>/publish \
   -H "X-Service-Key: dev-service-key-change-me" \
@@ -537,6 +537,58 @@ curl -sS -X POST http://localhost:8000/records/<RID>/publish-requests \
 
 ```bash
 ./examples/demo_windows.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
+```
+
+## 直接发布的签发时刻（取齐锁后再换算到期；跨界限整次拒绝）
+
+直接发布 `POST /records/{record_id}/publish` 的**令牌到期时刻、阅览时段截止与定时撤回到点判定，一律以“取齐本次签发所需行锁、惰性结算到点计划、并确认快照仍可发布之后”的服务端时刻 `now` 为准**（与公开读取、受控批准一致的“先取锁、后取时”）。
+
+- **为什么**：发布事务要先取**版本行** → **敏感短语清单单行** → **快照行** 三把行锁（与版本原文销毁、清单原子替换、撤回/定时撤回结算等并发事务串行）。在高并发下，请求可能在清单行锁或快照行锁上等待任意时长。若像旧实现那样在**等待前**就把相对时长 `expires_in_seconds` 换算成绝对到期时刻，等待一旦超过该时长，发布虽返回 `201`，却签出一枚**首次读取即已过期**的令牌（响应与落库还是等待前的旧 `expires_at`）。
+- **新签发规则**：
+  - **相对时长 `expires_in_seconds`**：在取齐行锁、确认快照仍可发布之后，按 `expires_at = now + expires_in_seconds` 换算——**锁等待不占用令牌寿命**；响应回显与 `read_tokens.expires_at` 落库使用**同一个绝对时刻**；
+  - **显式 `expires_at`**：提交时仍做一次“须晚于当前”的快速校验（沿用 `422 expires_at must be in the future`）；**获锁后再权威复核一次**——若等待期间该时刻已到，沿用同一 `422` **整次拒绝**（回滚本次尚未提交的快照 `INSERT`），**不留下新快照或令牌**；
+  - **快照阅览截止 `window_close_at`**：首次发布携带的时段、以及再次签发省略时段而**沿用快照首次窗口**的情形，都在获锁后复核截止未到；等待中截止到达同样按既有 `422 window_close_at must be in the future` 整次拒绝，不留下快照或令牌（显式填写与首次窗口不同仍维持既有 `409`，不改写快照）；
+  - **定时撤回计划到点优先结算**：等待期间计划到点时，先在快照行锁内按**预定时刻与计划原因**完成撤回并随本次拒绝一并提交，再返回既有 `409`，不签发令牌；
+  - **敏感短语核验**：仍在清单行锁内、按**获锁当时已提交的清单版本**核验拟发布版本原文（等待期间清单被替换则按新版本核验）；不通过沿用既有 `422`（响应只含未覆盖命中码点，不回显短语/原文），整次回滚不留快照/令牌。
+- **不变项**：受控记录 `409`、版本原文已销毁 `409`、已撤回版本再次发布 `409`、快照首次发布的时段约束、敏感短语核验口径、定时撤回“到点撤回优先结算”、受控发布与公开读取的全部约定均保持原样；启动方式、环境变量与数据库升级链（仍为 v8，无结构变更）完全不变。
+
+### 调用示例
+
+```bash
+# 相对到期：expires_in_seconds 从“取得必要锁、确认快照可发布之后”起算，
+# 即使因并发在清单/快照行锁上等待，等待时间也不会吃掉令牌寿命。
+curl -sS -X POST http://localhost:8000/records/<RID>/publish \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"version":1,"expires_in_seconds":3600,"max_reads":5}'
+# => 201 {"snapshot_id":"<SID>","status":"published","token":"<TOKEN>",
+#         "expires_at":"<取锁后 now + 3600s 的 UTC 时刻>", ...}
+# 响应 expires_at 与 GET /tokens/<TOKEN>（落库值）一致；签出后首次读取立即可用。
+
+# 显式绝对到期：提交时与获锁后各校验一次；若在等锁期间到达 -> 422 整次拒绝。
+curl -sS -X POST http://localhost:8000/records/<RID>/publish \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"version":1,"expires_at":"2000-01-01T00:00:00Z"}'
+# => 422 {"detail":"expires_at must be in the future"}
+
+# 阅览截止在等待中到达（首次窗口或沿用首次窗口）：422，且不留新快照/令牌。
+curl -sS -X POST http://localhost:8000/records/<RID>/publish \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"version":1,"window_open_at":"1999-01-01T00:00:00Z","window_close_at":"2000-01-01T00:00:00Z"}'
+# => 422 {"detail":"window_close_at must be in the future"}
+# GET /records/<RID> 可见 snapshots 仍为 []（整次拒绝，无残留）。
+```
+
+锁等待跨过到期/截止、到点撤回优先结算、以及“响应与落库 `expires_at` 一致”的确定性竞态由集成测试 `DirectPublishIssuanceTimeIntegrationTests` 覆盖（真实 PostgreSQL 行锁等待）：
+
+```bash
+python3 -m unittest \
+  tests.test_integration_api.DirectPublishIssuanceTimeIntegrationTests -v
+```
+
+仅用 HTTP API 的可运行演示（相对到期取锁后起算、首次读取立即可用、响应/落库 `expires_at` 一致、显式到期与阅览截止 `422` 不留快照、截止后沿用首次窗口再次签发被拒、`401` 鉴权）：
+
+```bash
+./examples/demo_publish_issuance.sh   # 可用 BASE_URL / SERVICE_KEY 覆盖
 ```
 
 ## 公开读取的行锁与时刻边界（跨界限统一模糊 403）
@@ -1211,7 +1263,7 @@ curl -s -X POST "$BASE/snapshot-withdrawal-plans" \
   - 结算发生在任何计数 `UPDATE` 与成功审计写入之前：到点后开始的公开读取沿用同一模糊 `403 snapshot unavailable`，不扣单令牌或共享凭证额度、不写成功读取审计；共享清单内其他快照不受影响；
   - 取消只允许在生效前：取消事务在快照行锁内先结算，计划恰在此时到点则撤回生效、取消 `409`；对 `completed/cancelled/superseded` 计划的取消一律 `409`，状态不被改变。
 - **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期/次数用尽/快照已撤回/记录已冻结/与快照不匹配统一返回模糊的 `403 snapshot unavailable`；维护侧令牌查询与受控申请查询只返回元数据与计数，错误信息不含原文内容，冻结/撤回原因仅维护侧可见。
-- **令牌**：`secrets.token_urlsafe(32)` 随机生成；支持 `expires_in_seconds` 或 `expires_at`（二选一）设置到期时间，并支持可选正整数 `max_reads` 读取次数上限；到期、撤销或次数用尽后读取一律拒绝。直接发布与受控批准共用同一套令牌规则、计数、查询与撤销接口。
+- **令牌**：`secrets.token_urlsafe(32)` 随机生成；支持 `expires_in_seconds` 或 `expires_at`（二选一）设置到期时间，并支持可选正整数 `max_reads` 读取次数上限；到期、撤销或次数用尽后读取一律拒绝。直接发布与受控批准共用同一套令牌规则、计数、查询与撤销接口。**相对时长的换算时刻**两者一致地取“取齐相关行锁、确认可签发之后”的服务端时刻（受控批准为申请行→清单行→快照行；直接发布为版本行→清单行→快照行）：锁等待不占用令牌寿命，响应回显与落库 `expires_at` 为同一绝对时刻；直接发布在显式 `expires_at` 或快照阅览截止于等待中到达时沿用既有 `422` 整次拒绝（回滚快照 `INSERT`），不留下新快照或令牌。
 - **受控发布**：
   - 申请行保存**冻结副本** `frozen_text`/`frozen_intervals`，复核批准基于副本做脱敏，历史版本行即使变化也不影响待审内容；
   - 批准/驳回先 `SELECT ... FOR UPDATE` 锁定申请行，把并发复核串行化：先提交者写入终态，后提交者看到非 `pending` 收到 `409`，配合 `status` 检查约束，保证同一申请只有一个终态；
